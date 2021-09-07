@@ -17,6 +17,9 @@
 #include <teavpn2/client/common.h>
 
 
+#define EPOLL_EVT_ARR_NUM 3u
+
+
 /*
  * UDP session struct.
  *
@@ -65,6 +68,11 @@ struct udp_sess {
 	 */
 	char					username[0x100];
 
+	/*
+	 * Human readable of @src_addr.
+	 */
+	char					str_src_addr[IPV4_L];
+
 	bool					is_authenticated;
 	_Atomic(bool)				is_connected;
 };
@@ -78,6 +86,34 @@ struct udp_map_bucket;
 struct udp_map_bucket {
 	struct udp_map_bucket			*next;
 	struct udp_sess				*sess;
+};
+
+
+struct srv_udp_state;
+
+
+struct epl_thread {
+	/*
+	 * Pointer to the UDP state struct.
+	 */
+	struct srv_udp_state			*state;
+
+	/*
+	 * pthread reference.
+	 */
+	pthread_t				thread;
+
+	int					epoll_fd;
+	int					epoll_timeout;
+	struct epoll_event			events[EPOLL_EVT_ARR_NUM];
+
+	/*
+	 * Is this thread online?
+	 */
+	_Atomic(bool)				is_online;
+
+	uint16_t				idx;
+	struct sc_pkt				*pkt;
 };
 
 
@@ -185,9 +221,7 @@ extern struct udp_sess *map_find_udp_sess(struct srv_udp_state *state,
 					  uint32_t addr, uint16_t port);
 extern struct udp_sess *get_udp_sess(struct srv_udp_state *state, uint32_t addr,
 				     uint16_t port);
-extern int put_udp_session(struct srv_udp_state *state,
-			   struct udp_sess *cur_sess);
-
+extern int put_udp_session(struct srv_udp_state *state, struct udp_sess *sess);
 
 
 static __always_inline void reset_udp_session(struct udp_sess *sess, uint16_t idx)
@@ -262,6 +296,12 @@ static __always_inline int get_unix_time(time_t *tm)
 	}
 	*tm = tv.tv_sec;
 	return ret;
+}
+
+
+static __always_inline int udp_sess_tv_update(struct udp_sess *cur_sess)
+{
+	return get_unix_time(&cur_sess->last_act);
 }
 
 
