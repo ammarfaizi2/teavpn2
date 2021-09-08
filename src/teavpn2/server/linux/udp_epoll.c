@@ -920,6 +920,115 @@ out:
 }
 
 
+static void zombie_chk_authenticated_sess(struct srv_udp_state *state,
+					  struct udp_sess *sess,
+					  time_t time_diff)
+{
+	size_t send_len;
+	struct srv_pkt *srv_pkt = &state->zr.pkt->srv;
+	struct epl_thread *thread = &state->epl_threads[0];
+	const time_t kill_timeout = UDP_SESS_TIMEOUT * 2;
+
+	if (time_diff > kill_timeout) {
+		close_udp_session(&state->epl_threads[0], sess);
+		return;
+	}
+
+	if (time_diff < UDP_SESS_TIMEOUT)
+		return;
+
+	send_len = srv_pprep(srv_pkt, TSRV_PKT_REQSYNC, 0, 0);
+	send_to_client(thread, sess, srv_pkt, send_len);
+}
+
+
+static void zombie_chk_unauthenticated_sess(struct srv_udp_state *state,
+					    struct udp_sess *sess,
+					    time_t time_diff)
+{
+	size_t send_len;
+	struct srv_pkt *srv_pkt = &state->zr.pkt->srv;
+	struct epl_thread *thread = &state->epl_threads[0];
+	const time_t kill_timeout = UDP_SESS_TIMEOUT;
+
+	if (time_diff > kill_timeout) {
+		send_len = srv_pprep(srv_pkt, TSRV_PKT_REQSYNC, 0, 0);
+		send_to_client(thread, sess, srv_pkt, send_len);
+	}
+}
+
+
+static void _run_zombie_reaper_thread(struct srv_udp_state *state)
+{
+	uint16_t i, j, max_conn = state->cfg->sock.max_conn;
+	struct udp_sess *sess, *sess_arr = state->sess_arr;
+
+	for (j = i = 0; i < max_conn; i++) {
+		time_t time_diff;
+
+		sess = &sess_arr[i];
+		if (!atomic_load(&sess->is_connected))
+			continue;
+
+		get_unix_time(&time_diff);
+		time_diff -= sess->last_act;
+
+		if (sess->is_authenticated)
+			zombie_chk_authenticated_sess(state, sess, time_diff);
+		else
+			zombie_chk_unauthenticated_sess(state, sess, time_diff);
+
+		if (atomic_load(&state->n_on_sess) <= ++j)
+			break;
+	}
+}
+
+
+static void *run_zombie_reaper_thread(void *state_p)
+{
+	struct srv_udp_state *state = (struct srv_udp_state *)state_p;
+
+	nice(40);
+	atomic_store(&state->zr.is_online, true);
+
+	state->zr.pkt = calloc_wrp(1ul, sizeof(*state->zr.pkt));
+	if (unlikely(!state->zr.pkt))
+		state->stop = true;
+
+	while (likely(!state->stop)) {
+		_run_zombie_reaper_thread(state);
+		sleep(10);
+	}
+
+	al64_free(state->zr.pkt);
+	atomic_store(&state->zr.is_online, false);
+	return NULL;
+}
+
+
+static int init_zombie_reaper_thread(struct srv_udp_state *state)
+{
+	int ret;
+	pthread_t *zr_thread = &state->zr.thread;
+
+	prl_notice(2, "Spawning zombie reaper thread...");
+	ret = pthread_create(zr_thread, NULL, run_zombie_reaper_thread, state);
+	if (unlikely(ret)) {
+		pr_err("pthread_create(): " PRERF, PREAR(ret));
+		return -ret;
+	}
+
+	pthread_setname_np(*zr_thread, "zombie-reaper");
+	ret = pthread_detach(*zr_thread);
+	if (unlikely(ret)) {
+		pr_err("pthread_detach(): " PRERF, PREAR(ret));
+		return -ret;
+	}
+
+	return ret;
+}
+
+
 static bool wait_for_threads_to_exit(struct srv_udp_state *state)
 {
 	uint8_t nn, i;
@@ -962,6 +1071,31 @@ static bool wait_for_threads_to_exit(struct srv_udp_state *state)
 		if (wait_c++ > 1000)
 			return false;
 	}
+	return true;
+}
+
+
+static bool wait_for_zombie_reaper_thread_to_exit(struct srv_udp_state *state)
+{
+	int ret;
+	unsigned wait_c = 0;
+
+	if (!atomic_load(&state->zr.is_online))
+		return true;
+
+	ret = pthread_kill(state->zr.thread, SIGTERM);
+	if (unlikely(ret)) {
+		pr_err("pthread_kill(state->zr.thread, SIGTERM): " PRERF,
+		       PREAR(ret));
+	}
+
+	prl_notice(2, "Waiting for zombie reaper thread to exit...");
+	while (atomic_load(&state->zr.is_online)) {
+		usleep(100000);
+		if (wait_c++ > 100)
+			return false;
+	}
+
 	return true;
 }
 
@@ -1019,19 +1153,24 @@ static void free_pkt_buffer(struct srv_udp_state *state)
 
 static void destroy_epoll(struct srv_udp_state *state)
 {
-	if (!wait_for_threads_to_exit(state)) {
-		/*
-		 * Thread(s) won't exit, don't free the heap!
-		 */
-		pr_emerg("Thread(s) won't exit!");
-		state->threads_wont_exit = true;
-		return;
-	}
+	if (!wait_for_zombie_reaper_thread_to_exit(state))
+		goto thread_wont_exit;
+
+	if (!wait_for_threads_to_exit(state))
+		goto thread_wont_exit;
 
 	close_epoll_fds(state);
 	close_client_sess(state);
 	free_pkt_buffer(state);
 	al64_free(state->epl_threads);
+	return;
+
+thread_wont_exit:
+	/*
+	 * Thread(s) won't exit, don't free the heap!
+	 */
+	pr_emerg("Thread(s) won't exit!");
+	state->threads_wont_exit = true;
 }
 
 
@@ -1039,11 +1178,16 @@ int teavpn2_udp_server_epoll(struct srv_udp_state *state)
 {
 	int ret;
 
+	state->stop = false;
+	atomic_store(&state->zr.is_online, false);
 	ret = init_epoll_thread_array(state);
 	if (unlikely(ret))
 		goto out;
 
-	state->stop = false;
+	ret = init_zombie_reaper_thread(state);
+	if (unlikely(ret))
+		goto out;
+
 	ret = run_event_loop(state);
 out:
 	destroy_epoll(state);

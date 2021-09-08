@@ -17,8 +17,10 @@
 #include <teavpn2/client/common.h>
 
 
-#define EPOLL_EVT_ARR_NUM 3u
-#define UDP_SESS_MAX_ERR 5u
+#define EPOLL_EVT_ARR_NUM	3u
+#define UDP_SESS_MAX_ERR	5u
+#define UDP_SESS_TIMEOUT	30
+
 
 /*
  * UDP session struct.
@@ -117,6 +119,23 @@ struct epl_thread {
 };
 
 
+struct zombie_reaper {
+	/*
+	 * Is zombie reaper online?
+	 */
+	_Atomic(bool)				is_online;
+
+
+	/*
+	 * Zombie reaper thread.
+	 */
+	pthread_t				thread;
+
+
+	struct sc_pkt				*pkt;
+};
+
+
 struct srv_udp_state {
 	/*
 	 * @stop is false when event loop is supposed to run.
@@ -147,7 +166,6 @@ struct srv_udp_state {
 	 * exit, otherwise it's false.
 	 */
 	bool					need_remove_iff;
-
 
 	/*
 	 * @sig should contain signal after signal interrupt
@@ -185,6 +203,9 @@ struct srv_udp_state {
 
 
 	_Atomic(uint16_t)			n_on_threads;
+
+
+	struct zombie_reaper			zr;
 
 
 	/*
