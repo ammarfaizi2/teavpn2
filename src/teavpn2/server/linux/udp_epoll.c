@@ -482,11 +482,74 @@ static int handle_new_client(struct epl_thread *thread,
 }
 
 
+static int handle_tun_data(struct epl_thread *thread, struct udp_sess *sess)
+{
+	uint16_t data_len;
+	ssize_t write_ret;
+	uint32_t emergency_count = 0;
+	int tun_fd = thread->state->tun_fds[0];
+	struct srv_pkt *srv_pkt = &thread->pkt->srv;
+
+	data_len  = ntohs(srv_pkt->len);
+
+write_again:
+	write_ret = write(tun_fd, srv_pkt->__raw, data_len);
+	if (unlikely(write_ret <= 0)) {
+		int err = errno;
+
+		if (write_ret == 0) {
+			if (data_len == 0)
+				return 0;
+
+			pr_err("write() to TUN fd returned zero");
+			return -ENETDOWN;
+		}
+
+		if (err == EAGAIN) {
+			thread->state->in_emergency = true;
+
+			if (emergency_count++ == 0) {
+				pr_emerg("TUN buffer is full, cannot write!");
+				pr_emerg("Initiate soft loop on sys_write...");
+			}
+
+			if (emergency_count > 5000) {
+				pr_emerg("Giving up, cannot write to TUN fd...");
+				return -ENETDOWN;
+			}
+
+			/* Calm down a bit... */
+			usleep(100000);
+			goto write_again;
+		}
+
+		prl_notice(4, "Bad packet from " PRWIU ", write(): " PRERF,
+			   W_IU(sess), PREAR(err));
+
+		if (++sess->err_c > UDP_SESS_MAX_ERR)
+			close_udp_session(thread, sess);
+
+		return 0;
+	}
+
+	pr_debug("[thread=%u] TUN write(%d, buf, %hu) = %zd bytes", thread->idx,
+		 tun_fd, data_len, write_ret);
+
+	if (unlikely(emergency_count > 0)) {
+		thread->state->in_emergency = false;
+		pr_emerg("Recovered from EAGAIN!");
+	}
+
+	return 0;
+}
+
+
 static int __handle_event_udp(struct epl_thread *thread,
 			      struct srv_udp_state *state,
 			      struct udp_sess *sess)
 {
 	struct cli_pkt *cli_pkt = &thread->pkt->cli;
+	(void)state;
 
 	switch (cli_pkt->type) {
 	case TCLI_PKT_HANDSHAKE:
@@ -496,13 +559,31 @@ static int __handle_event_udp(struct epl_thread *thread,
 		return 0;
 	case TCLI_PKT_AUTH:
 		return handle_clpkt_auth(thread, sess);
-	case TCLI_PKT_CLOSE:
-		close_udp_session(thread, sess);
+	case TCLI_PKT_TUN_DATA:
+		return handle_tun_data(thread, sess);
+	case TCLI_PKT_REQSYNC:
 		return 0;
 	case TCLI_PKT_SYNC:
 		return 0;
-	default:
+	case TCLI_PKT_PING:
+		return sess->is_authenticated ? 0 : -EBADRQC;
+	case TCLI_PKT_CLOSE:
+		close_udp_session(thread, sess);
 		return 0;
+	default:
+
+		if (sess->is_authenticated) {
+			/*
+			 * If an authenticated client sends an invalid packet,
+			 * give it a chance to sync. It could be a bit network
+			 * problem.
+			 */
+			// return request_sync(thread, sess);
+			return 0;
+		}
+
+		/* Bad packet! */
+		return -EBADRQC;
 	}
 }
 
@@ -511,6 +592,7 @@ static int _handle_event_udp(struct epl_thread *thread,
 			     struct srv_udp_state *state,
 			     struct sockaddr_in *saddr)
 {
+	int ret;
 	uint16_t port;
 	uint32_t addr;
 	struct udp_sess *sess;
@@ -523,11 +605,20 @@ static int _handle_event_udp(struct epl_thread *thread,
 		 * It's a new client since we don't find it in
 		 * the session map.
 		 */
-		int ret = handle_new_client(thread, state, addr, port, saddr);
+		ret = handle_new_client(thread, state, addr, port, saddr);
 		return (ret == -EAGAIN) ? 0 : ret;
 	}
 
-	return __handle_event_udp(thread, state, sess);
+	ret = __handle_event_udp(thread, state, sess);
+	if (unlikely(ret)) {
+		if (ret == -EBADRQC) {
+			close_udp_session(thread, sess);
+			return 0;
+		}
+		return ret;
+	}
+
+	return 0;
 }
 
 
@@ -582,6 +673,70 @@ static int handle_event_udp(struct epl_thread *thread,
 }
 
 
+/*
+ * return -ENOENT if cannot find the destination.
+ * return 0 if it finds the destination.
+ * return -errno if it errors.
+ */
+static int route_ipv4_packet(struct epl_thread *thread, __be32 dst_addr,
+			     struct udp_sess *sess_arr, size_t send_len)
+{
+	uint16_t idx;
+	int32_t find;
+	ssize_t send_ret;
+	struct udp_sess *dst_sess;
+
+	find = get_route_map(thread->state->ipv4_map, dst_addr);
+	if (unlikely(find == -1))
+		return -ENOENT;
+
+	idx      = (uint16_t)find;
+	dst_sess = &sess_arr[idx];
+	send_ret = send_to_client(thread, dst_sess, &thread->pkt->srv, send_len);
+	if (send_ret < 0)
+		return (int)send_ret;
+
+	return 0;
+}
+
+
+static int route_packet(struct epl_thread *thread, struct srv_udp_state *state,
+			ssize_t len)
+{
+	int ret;
+	ssize_t send_ret;
+	size_t send_len, i;
+	struct srv_pkt *srv_pkt = &thread->pkt->srv;
+	struct udp_sess	*sess_arr = state->sess_arr;
+	uint16_t max_conn = state->cfg->sock.max_conn;
+	struct iphdr *iphdr = &srv_pkt->tun_data.iphdr;
+
+	send_len = srv_pprep(srv_pkt, TSRV_PKT_TUN_DATA, (uint16_t)len, 0);
+	if (likely(iphdr->version == 4)) {
+		ret = route_ipv4_packet(thread, ntohl(iphdr->daddr), sess_arr,
+					send_len);
+		if (ret != -ENOENT)
+			return ret;
+	}
+
+	/*
+	 * Broadcast this to all authenticated clients.
+	 */
+	for (i = 0; i < max_conn; i++) {
+		struct udp_sess	*sess = &sess_arr[i];
+
+		if (!sess->is_authenticated)
+			continue;
+
+		send_ret = send_to_client(thread, sess, srv_pkt, send_len);
+		if (send_ret < 0)
+			return (int)send_ret;
+	}
+
+	return 0;
+}
+
+
 static int handle_event_tun(struct epl_thread *thread,
 			    struct srv_udp_state *state, int tun_fd)
 {
@@ -601,11 +756,10 @@ static int handle_event_tun(struct epl_thread *thread,
 	}
 
 	thread->pkt->len = (size_t)read_ret;
-	pr_debug("[thread=%hu] read() from tun_fd (fd=%d) %zd bytes",
-		 thread->idx, tun_fd, read_ret);
+	pr_debug("[thread=%hu] TUN read(%d, buf, %zu) = %zd bytes",
+		 thread->idx, tun_fd, read_size, read_ret);
 
-	(void)state;
-	return 0;
+	return route_packet(thread, state, read_ret);
 }
 
 

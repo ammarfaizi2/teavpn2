@@ -18,7 +18,7 @@
 
 
 #define EPOLL_EVT_ARR_NUM 3u
-
+#define UDP_SESS_MAX_ERR 5u
 
 /*
  * UDP session struct.
