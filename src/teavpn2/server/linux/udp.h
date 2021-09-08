@@ -219,6 +219,12 @@ struct srv_udp_state {
 };
 
 
+#define W_IP(CLIENT) 	((CLIENT)->str_src_addr), ((CLIENT)->src_port)
+#define W_UN(CLIENT) 	((CLIENT)->username)
+#define W_IU(CLIENT) 	W_IP(CLIENT), W_UN(CLIENT), ((CLIENT)->idx)
+#define PRWIU 		"%s:%d (%s) (cli_idx=%hu)"
+
+
 extern int teavpn2_udp_server_epoll(struct srv_udp_state *state);
 extern int teavpn2_udp_server_io_uring(struct srv_udp_state *state);
 extern struct udp_sess *map_find_udp_sess(struct srv_udp_state *state,
