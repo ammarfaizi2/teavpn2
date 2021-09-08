@@ -52,6 +52,8 @@ struct udp_sess {
 	 */
 	uint16_t				err_c;
 
+	uint16_t				loop_c;
+
 	/*
 	 * UDP is stateless, we may not know whether the
 	 * client is still online or not, @last_act can
@@ -262,6 +264,7 @@ static __always_inline void reset_udp_session(struct udp_sess *sess, uint16_t id
 	sess->src_port = 0u;
 	sess->idx      = idx;
 	sess->err_c    = 0u;
+	sess->loop_c   = 0u;
 	sess->last_act = 0;
 	memset(&sess->addr, 0, sizeof(sess->addr));
 	sess->username[0] = '_';
@@ -330,9 +333,9 @@ static __always_inline int get_unix_time(time_t *tm)
 }
 
 
-static __always_inline int udp_sess_tv_update(struct udp_sess *cur_sess)
+static __always_inline int udp_sess_tv_update(struct udp_sess *sess)
 {
-	return get_unix_time(&cur_sess->last_act);
+	return get_unix_time(&sess->last_act);
 }
 
 

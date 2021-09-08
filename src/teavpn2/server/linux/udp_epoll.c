@@ -565,6 +565,7 @@ static int __handle_event_udp(struct epl_thread *thread,
 	case TCLI_PKT_REQSYNC:
 		return 0;
 	case TCLI_PKT_SYNC:
+		udp_sess_tv_update(sess);
 		return 0;
 	case TCLI_PKT_PING:
 		return sess->is_authenticated ? 0 : -EBADRQC;
@@ -609,6 +610,9 @@ static int _handle_event_udp(struct epl_thread *thread,
 		ret = handle_new_client(thread, state, addr, port, saddr);
 		return (ret == -EAGAIN) ? 0 : ret;
 	}
+
+	if ((++sess->loop_c % 8) == 0)
+		udp_sess_tv_update(sess);
 
 	ret = __handle_event_udp(thread, state, sess);
 	if (unlikely(ret)) {
