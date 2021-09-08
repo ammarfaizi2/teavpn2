@@ -920,6 +920,21 @@ out:
 }
 
 
+static int zombie_close_sess(struct srv_udp_state *state, struct udp_sess *sess)
+{
+	size_t send_len;
+	struct srv_pkt *srv_pkt = &state->zr.pkt->srv;
+
+	prl_notice(2, "[zombie reaper] Closing session " PRWIU "...", W_IU(sess));
+	if (sess->ipv4_iff != 0)
+		del_ipv4_route_map(state->ipv4_map, sess->ipv4_iff);
+
+	send_len = srv_pprep(srv_pkt, TSRV_PKT_CLOSE, 0, 0);
+	send_to_client(&state->epl_threads[0], sess, srv_pkt, send_len);
+	return put_udp_session(state, sess);
+}
+
+
 static void zombie_chk_authenticated_sess(struct srv_udp_state *state,
 					  struct udp_sess *sess,
 					  time_t time_diff)
@@ -930,12 +945,15 @@ static void zombie_chk_authenticated_sess(struct srv_udp_state *state,
 	const time_t kill_timeout = UDP_SESS_TIMEOUT * 2;
 
 	if (time_diff > kill_timeout) {
-		close_udp_session(&state->epl_threads[0], sess);
+		zombie_close_sess(state, sess);
 		return;
 	}
 
 	if (time_diff < UDP_SESS_TIMEOUT)
 		return;
+
+	prl_notice(3, "[zombie reaper] Sending request sync packet to " PRWIU,
+		   W_IU(sess));
 
 	send_len = srv_pprep(srv_pkt, TSRV_PKT_REQSYNC, 0, 0);
 	send_to_client(thread, sess, srv_pkt, send_len);
@@ -946,15 +964,10 @@ static void zombie_chk_unauthenticated_sess(struct srv_udp_state *state,
 					    struct udp_sess *sess,
 					    time_t time_diff)
 {
-	size_t send_len;
-	struct srv_pkt *srv_pkt = &state->zr.pkt->srv;
-	struct epl_thread *thread = &state->epl_threads[0];
 	const time_t kill_timeout = UDP_SESS_TIMEOUT;
 
-	if (time_diff > kill_timeout) {
-		send_len = srv_pprep(srv_pkt, TSRV_PKT_REQSYNC, 0, 0);
-		send_to_client(thread, sess, srv_pkt, send_len);
-	}
+	if (time_diff > kill_timeout)
+		zombie_close_sess(state, sess);
 }
 
 
@@ -962,6 +975,9 @@ static void _run_zombie_reaper_thread(struct srv_udp_state *state)
 {
 	uint16_t i, j, max_conn = state->cfg->sock.max_conn;
 	struct udp_sess *sess, *sess_arr = state->sess_arr;
+
+	pr_debug("[zombie reaper] Online client(s): %hu",
+		 atomic_load(&state->n_on_sess));
 
 	for (j = i = 0; i < max_conn; i++) {
 		time_t time_diff;
@@ -1120,7 +1136,7 @@ static void close_epoll_fds(struct srv_udp_state *state)
 }
 
 
-static void close_client_sess(struct srv_udp_state *state)
+static void close_all_client_sess(struct srv_udp_state *state)
 {
 	struct udp_sess *sess_arr = state->sess_arr;
 	uint16_t i, max_conn = state->cfg->sock.max_conn;
@@ -1160,7 +1176,7 @@ static void destroy_epoll(struct srv_udp_state *state)
 		goto thread_wont_exit;
 
 	close_epoll_fds(state);
-	close_client_sess(state);
+	close_all_client_sess(state);
 	free_pkt_buffer(state);
 	al64_free(state->epl_threads);
 	return;

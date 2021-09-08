@@ -184,17 +184,20 @@ out:
 }
 
 
-int put_udp_session(struct srv_udp_state *state, struct udp_sess *sess)
+int put_udp_session(struct srv_udp_state *state, struct udp_sess *cur_sess)
 	__acquires(&state->sess_stk_lock)
 	__releases(&state->sess_stk_lock)
 {
 	int ret = 0;
 	mutex_lock(&state->sess_stk_lock);
-	BUG_ON(bt_stack_push(&state->sess_stk, sess->idx) == -1);
+	if (!atomic_load(&cur_sess->is_connected) && cur_sess->src_addr == 0)
+		goto out;
+	BUG_ON(bt_stack_push(&state->sess_stk, cur_sess->idx) == -1);
 	if (state->sess_map)
-		ret = remove_sess_from_bkt(state, sess);
-	reset_udp_session(sess, sess->idx);
+		ret = remove_sess_from_bkt(state, cur_sess);
+	reset_udp_session(cur_sess, cur_sess->idx);
 	mutex_unlock(&state->sess_stk_lock);
 	atomic_fetch_sub(&state->n_on_sess, 1);
+out:
 	return ret;
 }
