@@ -833,7 +833,7 @@ static void close_epoll_fds(struct srv_udp_state *state)
 
 static void close_client_sess(struct srv_udp_state *state)
 {
-	struct udp_sess	*sess_arr = state->sess_arr;
+	struct udp_sess *sess_arr = state->sess_arr;
 	uint16_t i, max_conn = state->cfg->sock.max_conn;
 
 	if (unlikely(!sess_arr))
