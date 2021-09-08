@@ -183,6 +183,10 @@ struct srv_udp_state {
 	 */
 	_Atomic(uint16_t)			n_on_sess;
 
+
+	_Atomic(uint16_t)			n_on_threads;
+
+
 	/*
 	 * @tun_fds is an array of TUN file descriptors.
 	 * Number of TUN file descriptor can be more than
@@ -302,6 +306,60 @@ static __always_inline int get_unix_time(time_t *tm)
 static __always_inline int udp_sess_tv_update(struct udp_sess *cur_sess)
 {
 	return get_unix_time(&cur_sess->last_act);
+}
+
+
+static inline void add_ipv4_route_map(uint16_t (*ipv4_map)[0x100], uint32_t addr,
+				      uint16_t idx)
+{
+	/*
+	 * IPv4 looks like this:
+	 *     AA.BB.CC.DD
+	 *
+	 * DD is the byte0
+	 * CC is the byte1
+	 */
+
+	uint16_t byte0, byte1;
+
+	byte0 = (addr >> 0u) & 0xffu;
+	byte1 = (addr >> 8u) & 0xffu;
+	ipv4_map[byte0][byte1] = idx + 1u;
+}
+
+
+static inline void del_ipv4_route_map(uint16_t (*ipv4_map)[0x100], uint32_t addr)
+{
+	/*
+	 * IPv4 looks like this:
+	 *     AA.BB.CC.DD
+	 *
+	 * DD is the byte0
+	 * CC is the byte1
+	 */
+
+	uint16_t byte0, byte1;
+
+	byte0 = (addr >> 0u) & 0xffu;
+	byte1 = (addr >> 8u) & 0xffu;
+	ipv4_map[byte0][byte1] = 0;
+}
+
+
+static inline int32_t get_route_map(uint16_t (*ipv4_map)[0x100], uint32_t addr)
+{
+	uint16_t ret, byte0, byte1;
+
+	byte0 = (addr >> 0u) & 0xffu;
+	byte1 = (addr >> 8u) & 0xffu;
+	ret   = ipv4_map[byte0][byte1];
+
+	if (ret == 0) {
+		/* Unmapped address. */
+		return -1;
+	}
+
+	return (int32_t)(ret - 1);
 }
 
 
