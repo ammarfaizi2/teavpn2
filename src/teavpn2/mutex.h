@@ -7,39 +7,22 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 #include <teavpn2/common.h>
 
-#define MUTEX_LEAK_ASSERT 0
-#define MUTEX_LOCK_ASSERT 0
+#define MUTEX_INIT		{PTHREAD_MUTEX_INITIALIZER, NULL}
+#define DEFINE_MUTEX(VAR_NAME) 	struct tmutex VAR_NAME = MUTEX_INIT
 
 struct tmutex {
 	pthread_mutex_t			mutex;
-#if MUTEX_LEAK_ASSERT
-	union {
-		void			*__leak_assert;
-		uint64_t		need_destroy;
-	};
-#else
-	bool				need_destroy;
-#endif /* #if MUTEX_LEAK_ASSERT */
+#ifdef CONFIG_MUTEX_LEAK_ASSERT
+	char				*__leak_ptr;
+#endif	
 };
 
-
-static __always_inline void mutex_init_mark(struct tmutex *m)
-{
-#if MUTEX_LEAK_ASSERT
-	m->__leak_assert = malloc(1);
-	if (unlikely(!m->__leak_assert))
-		panic("Cannot initialize __leak_assert for mutex_init_mark");
-#else
-	m->need_destroy = 1;
-#endif /* #if MUTEX_LEAK_ASSERT */
-}
-
-
-static __cold __always_inline int mutex_init(struct tmutex *m,
-					     const pthread_mutexattr_t *attr)
+static __always_inline int mutex_init(struct tmutex *m,
+				      const pthread_mutexattr_t *attr)
 {
 	int ret;
 
@@ -50,59 +33,43 @@ static __cold __always_inline int mutex_init(struct tmutex *m,
 		pr_err("pthread_mutex_init(): " PRERF, PREAR(ret));
 		return -ret;
 	}
-	mutex_init_mark(m);
-	return ret;
-}
 
-
-static __hot __always_inline int mutex_lock(struct tmutex *m)
-{
-	int ret;
-	__asm__ volatile("":"+r"(m)::"memory");
-	ret = pthread_mutex_lock(&m->mutex);
-#if MUTEX_LOCK_ASSERT
-	BUG_ON(ret != 0);
+#ifdef CONFIG_MUTEX_LEAK_ASSERT
+	m->__leak_ptr = malloc(1);
+	if (unlikely(!m->__leak_ptr)) {
+		panic("mutex_init(): Cannot init __leak_ptr");
+		__builtin_unreachable();
+	}
+	m->__leak_ptr[0] = 0;
 #endif
 	return ret;
 }
 
-
-static __hot __always_inline int mutex_unlock(struct tmutex *m)
+static __always_inline int mutex_lock(struct tmutex *m)
 {
-	int ret;
-	__asm__ volatile("":"+r"(m)::"memory");
-	ret = pthread_mutex_unlock(&m->mutex);
-#if MUTEX_LOCK_ASSERT
-	BUG_ON(ret != 0);
-#endif
-	return ret;
+	return pthread_mutex_lock(&m->mutex);
 }
 
+static __always_inline int mutex_unlock(struct tmutex *m)
+{
+	return pthread_mutex_unlock(&m->mutex);
+}
 
 static __always_inline int mutex_trylock(struct tmutex *m)
 {
-	__asm__ volatile("":"+r"(m)::"memory");
 	return pthread_mutex_trylock(&m->mutex);
 }
 
-
-static __cold inline int mutex_destroy(struct tmutex *m)
+static __always_inline int mutex_destroy(struct tmutex *m)
 {
-	if (m->need_destroy) {
-		int ret = pthread_mutex_destroy(&m->mutex);
-		if (unlikely(ret)) {
-			pr_err("pthread_mutex_destroy(): " PRERF, PREAR(ret));
-			return -ret;
-		}
+	int ret;
 
-#if MUTEX_LEAK_ASSERT
-		free(m->__leak_assert);
-		m->__leak_assert = NULL;
-#else
-		m->need_destroy = 0;
+	ret = pthread_mutex_destroy(&m->mutex);
+#ifdef CONFIG_MUTEX_LEAK_ASSERT
+	free(m->__leak_ptr);
 #endif
-	}
-	return 0;
+	memset(m, 0, sizeof(*m));
+	return ret;
 }
 
 #endif /* #ifndef TEAVPN2__MUTEX_H */
